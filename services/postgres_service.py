@@ -1,4 +1,6 @@
 # -*- coding: latin-1 -*-
+# Modified 2026 for the Kaggle Python & PostgreSQL Pipeline Optimization Challenge: execute_cross_table_expansion can run
+# the parallel, resumable executor in services/parallel_expansion.py (see challenge/README.md). Original: igorsiecz, Apache-2.0.
 import csv
 import hashlib
 import io
@@ -14,9 +16,12 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+import os
+
 import paramiko
 import pandas as pd
 
+from services import parallel_expansion
 from config import (
     CONTROL_DB,
     CONTROL_SCHEMA,
@@ -13537,11 +13542,20 @@ WHERE database_name = {sql_literal(database_name)}
         if not prepared_destinations:
             raise RuntimeError("Add at least one expansion destination.")
 
+        scope_sql = ", ".join(sql_literal(value) for value in normalized_raw_schemas)
         return {
             "source_schema_name": source_schema_name,
             "source_table_name": source_table_name,
             "raw_schemas": normalized_raw_schemas,
             "destinations": prepared_destinations,
+            # identical text to the one substituted into every statement (_prepare_cross_table_expansion_statement)
+            "source_relation_sql": (
+                "(\n"
+                f"    SELECT *\n"
+                f"    FROM {sql_ident(source_schema_name)}.{sql_ident(source_table_name)}\n"
+                f"    WHERE {sql_ident('raw_schema')} IN ({scope_sql})\n"
+                ")"
+            ),
         }
 
     @staticmethod
@@ -13784,6 +13798,106 @@ SELECT json_build_object(
     ), '[]'::json)
 )::text;
 """.strip()
+
+    def _build_parallel_cross_table_expansion_script(
+        self,
+        database_name: str,
+        prepared: dict,
+        manifest_sql: str,
+        timing_table_sql: str,
+        timing_result_sql: str,
+        source_columns: dict,
+        timing_report: dict | None,
+        cancel_event=None,
+    ) -> str | None:
+        """Bash script for the parallel, chunked, resumable executor, or None to keep the single-transaction path.
+
+        PGDM_EXPAND_WORKERS: 0/unset = number of server CPUs (max 16), 1 = original single-transaction batch.
+        PGDM_EXPAND_CHUNKS: raw_id ranges per chunked recipe (default 4 x workers).
+        """
+        requested_workers = str(os.environ.get("PGDM_EXPAND_WORKERS", "0")).strip() or "0"
+        if requested_workers == "1":
+            return None
+        if str(source_columns.get("raw_id") or "").lower() not in {"bigint", "integer", "smallint"}:
+            return None  # chunking needs the integer raw_id key of the generator's raw_data
+        source_relation_sql = prepared["source_relation_sql"]
+        source_qualified = (
+            f"{sql_ident(prepared['source_schema_name'])}."
+            f"{sql_ident(prepared['source_table_name'])}"
+        )
+        scope_sql = ", ".join(sql_literal(value) for value in prepared["raw_schemas"])
+        with self.expansion_timing_scope(
+            timing_report,
+            "preflight",
+            "Read source raw_id range and server CPU count",
+        ):
+            output = self.run_remote_command(
+                f"nproc; psql -h localhost -U {shlex.quote(self.sql_username)} "
+                f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 -f -",
+                stdin_text=(
+                    f"SELECT COALESCE(min(raw_id) - 1, 0) || '|' || COALESCE(max(raw_id), 0) "
+                    f"FROM {source_qualified} WHERE {sql_ident('raw_schema')} IN ({scope_sql});\n"
+                ),
+                cancel_event=cancel_event,
+            )
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        try:
+            server_cpus = int(lines[0])
+            lo, hi = (int(value) for value in lines[-1].split("|"))
+        except (IndexError, ValueError):
+            return None
+        workers = int(requested_workers) if requested_workers.isdigit() and int(requested_workers) > 1 else min(
+            max(server_cpus, 1), 16
+        )
+        if workers <= 1 or hi <= lo:
+            return None
+        chunks = int(os.environ.get("PGDM_EXPAND_CHUNKS") or 4 * workers)
+        destinations = []
+        readers = parallel_expansion.read_by_others(prepared["destinations"])
+        for destination in prepared["destinations"]:
+            destinations.append(
+                dict(
+                    destination,
+                    qualified_name=(
+                        f"{sql_ident(destination['schema_name'])}."
+                        f"{sql_ident(destination['pure_table_name'])}"
+                    ),
+                    read_by_others=destination["table_name"] in readers,
+                )
+            )
+
+        def dml_builder(statement, destination, statement_index):
+            return self._build_managed_dml_sql(
+                statement,
+                destination["schema_name"],
+                destination["pure_table_name"],
+                "add",
+                timing_sequence=1,
+                timing_stage="execute",
+                timing_name=(
+                    f"Insert into {destination['table_name']} (statement {statement_index})"
+                ),
+                timing_destination=destination["table_name"],
+                timing_statement_index=statement_index,
+            )
+
+        script, _key = parallel_expansion.build_parallel_expansion_script(
+            database_name=shlex.quote(database_name),
+            sql_username=shlex.quote(self.sql_username),
+            source_qualified=source_qualified,
+            source_relation_sql=source_relation_sql,
+            manifest_sql=manifest_sql,
+            destinations=destinations,
+            waves=parallel_expansion.plan_waves(destinations, source_relation_sql),
+            dml_builder=dml_builder,
+            lo=lo,
+            hi=hi,
+            workers=workers,
+            chunks=chunks,
+            timing_table_sql=timing_table_sql,
+            timing_result_sql=timing_result_sql,
+        )
+        return script
 
     def execute_cross_table_expansion(
         self,
@@ -14066,18 +14180,38 @@ FROM pg_temp.pgdm_expansion_timings;
             f"-d {shlex.quote(database_name)} "
             "-X -qAt -v ON_ERROR_STOP=1 -f -"
         )
+        parallel_script = self._build_parallel_cross_table_expansion_script(
+            database_name,
+            prepared,
+            manifest_sql,
+            timing_table_sql,
+            timing_result_sql,
+            source_columns,
+            timing_report,
+            cancel_event=cancel_event,
+        )
+        if parallel_script is not None:
+            # One bash script over the same SSH channel; psql workers run on the server (no server-side Python).
+            command = "bash -s"
+            wrapped_sql = parallel_script
         self._notify_progress(
             progress_callback,
             "execute",
             5,
-            "Running all expansions in a single transaction...",
+            (
+                "Running the expansion in parallel, resumable chunks..."
+                if parallel_script is not None
+                else "Running all expansions in a single transaction..."
+            ),
         )
         with self.expansion_timing_scope(
             timing_report,
             "execute",
             "Expansion database batch envelope",
             record_local_cpu=False,
-            remote_include_in_total=False,
+            # parallel: the server wall clock of the whole envelope IS the processing time (chunks overlap, so their
+            # per-statement seconds are reported as diagnostics and not summed)
+            remote_include_in_total=parallel_script is not None,
         ):
             output = self.run_remote_command(
                 command,
@@ -14116,6 +14250,25 @@ FROM pg_temp.pgdm_expansion_timings;
                     server_timing_items = list(
                         parsed_candidate.get("pgdm_expansion_timings") or []
                     )
+                if "pgdm_chunks" in parsed_candidate:
+                    for chunk in parsed_candidate.get("pgdm_chunks") or []:
+                        unit = str(chunk.get("unit") or "")
+                        server_timing_items.append({
+                            "stage": "execute",
+                            "name": f"Insert into {unit.rsplit('#', 1)[0]} (statement {unit.rsplit('#', 1)[-1]}, "
+                                    f"chunk raw_id > {chunk.get('lo')})",
+                            "duration_seconds": chunk.get("seconds"),
+                            "rows": chunk.get("rows"),
+                            "destination": unit.rsplit("#", 1)[0],
+                            "parallel": True,
+                        })
+                if "pgdm_phase" in parsed_candidate:
+                    server_timing_items.append({
+                        "stage": "execute",
+                        "name": f"Parallel phase: {parsed_candidate.get('pgdm_phase')}",
+                        "duration_seconds": parsed_candidate.get("seconds"),
+                        "parallel": True,
+                    })
             for item in server_timing_items:
                 self._append_expansion_timing(
                     timing_report,
@@ -14128,7 +14281,14 @@ FROM pg_temp.pgdm_expansion_timings;
                     details=(
                         "Measured with PostgreSQL clock_timestamp() in the server "
                         "session; SSH transport is excluded."
+                        + (
+                            " Parallel run: overlapping step, diagnostic only (the "
+                            "envelope wall time is counted)."
+                            if parallel_script is not None
+                            else ""
+                        )
                     ),
+                    include_in_total=parallel_script is None,
                 )
         if manifest is None:
             raise RuntimeError(
