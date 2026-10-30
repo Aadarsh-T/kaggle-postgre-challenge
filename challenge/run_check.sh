@@ -14,7 +14,7 @@ PSQL="psql -X -qAt -v ON_ERROR_STOP=1"
 now() { date +%s.%N; }
 
 if [ -z "${SKIP_GEN:-}" ]; then  # SKIP_GEN=1: reuse an existing kaggle_challenge database
-echo "== 1. unit tests"; python3 -m unittest discover -s tests -v 2>&1 | tail -5
+echo "== 1. unit tests"; python3 -m unittest discover -s tests -v > "$OUT/tests.txt" 2>&1 && echo TESTS_OK || echo "TESTS_FAILED (see $OUT/tests.txt)"; tail -4 "$OUT/tests.txt"
 
 echo "== 2. generate $ROWS rows"
 python3 generate_database.py --rows "$ROWS" --replace --user "${PGUSER:-$USER}" ${PGHOST:+--host "$PGHOST"} ${PGPORT:+--postgres_port "$PGPORT"}
