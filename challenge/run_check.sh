@@ -4,7 +4,8 @@
 # Connection via libpq env (PGHOST, PGPORT, PGUSER, PGPASSWORD or ~/.pgpass). Usage: challenge/run_check.sh [ROWS] (default 300000)
 # Steps: 1 upstream + new unit tests, 2 generate kaggle_challenge, 3 serial baseline (the app's single REPEATABLE READ batch,
 # recipes 01..06), 4 parallel script, 5 id-insensitive digests of all six tables must match, 6 crash + resume test,
-# 7 malformed input: both paths must fail with the same SQL error and leave every table, counter and constraint unchanged.
+# 7 malformed input: both paths must fail with the same SQL error and leave every table, counter and constraint unchanged,
+# 8 the same for a failing deferred constraint (a temporary UNIQUE on table5.numeric_column_1 that the data violates).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROWS=${1:-300000}
@@ -31,6 +32,8 @@ reset() {
     ON CONFLICT (schema_name, table_name) DO UPDATE SET row_count = 0"
   $PSQL -c "VACUUM ANALYZE public.raw_data" >/dev/null
 }
+state() { $PSQL -c "SELECT string_agg(table_name || '=' || row_count, ' ' ORDER BY table_name) FROM public.pgdm_table_row_counts"
+  $PSQL -c "SELECT string_agg(conrelid::regclass || ' ' || conname, ', ' ORDER BY conrelid::regclass::text, conname) FROM pg_constraint WHERE conrelid::regclass::text ~ 'table[1-6]$'"; }
 SRC="(SELECT * FROM \"public\".\"raw_data\" WHERE \"raw_schema\" IN ('group001'))"
 
 echo "== 3. serial baseline (one REPEATABLE READ transaction, recipes 01..06)"
@@ -42,17 +45,17 @@ reset
   done; echo "COMMIT;"; } > "$OUT/baseline.sql"
 t0=$(now); $PSQL -f "$OUT/baseline.sql"; t1=$(now)
 echo "baseline_seconds $(awk "BEGIN{print $t1 - $t0}")" | tee "$OUT/times.txt"
-$PSQL -f challenge/digest.sql > "$OUT/digest_baseline.txt"; $PSQL -c "SELECT table_name, row_count FROM public.pgdm_table_row_counts ORDER BY 1" > "$OUT/counts_baseline.txt"
+state > "$OUT/state_baseline.txt"; $PSQL -f challenge/digest.sql > "$OUT/digest_baseline.txt"; $PSQL -c "SELECT table_name, row_count FROM public.pgdm_table_row_counts ORDER BY 1" > "$OUT/counts_baseline.txt"
 
 echo "== 4. parallel expansion"
 reset
 DB=$PGDATABASE HI=$HI WORKERS=${WORKERS:-$(nproc)} CHUNKS=${CHUNKS:-$((4 * $(nproc)))} OUT="$OUT/parallel.sh" python3 challenge/bench_harness.py "SQL files" >/dev/null
 t0=$(now); bash "$OUT/parallel.sh" > "$OUT/parallel_stdout.txt"; t1=$(now)
 echo "parallel_seconds $(awk "BEGIN{print $t1 - $t0}")" | tee -a "$OUT/times.txt"
-$PSQL -f challenge/digest.sql > "$OUT/digest_parallel.txt"; $PSQL -c "SELECT table_name, row_count FROM public.pgdm_table_row_counts ORDER BY 1" > "$OUT/counts_parallel.txt"
+state > "$OUT/state_parallel_run.txt"; $PSQL -f challenge/digest.sql > "$OUT/digest_parallel.txt"; $PSQL -c "SELECT table_name, row_count FROM public.pgdm_table_row_counts ORDER BY 1" > "$OUT/counts_parallel.txt"
 
 echo "== 5. equivalence"
-diff "$OUT/digest_baseline.txt" "$OUT/digest_parallel.txt" && diff "$OUT/counts_baseline.txt" "$OUT/counts_parallel.txt" && echo "DIGESTS_AND_COUNTERS_IDENTICAL"
+diff "$OUT/digest_baseline.txt" "$OUT/digest_parallel.txt" && diff "$OUT/counts_baseline.txt" "$OUT/counts_parallel.txt" && diff "$OUT/state_baseline.txt" "$OUT/state_parallel_run.txt" && echo "DIGESTS_COUNTERS_CONSTRAINTS_IDENTICAL"
 
 echo "== 6. crash + resume"
 reset
@@ -60,13 +63,11 @@ reset
 if bash "$OUT/parallel.sh" > "$OUT/crash_stdout.txt" 2> "$OUT/crash_stderr.txt"; then echo "run finished before the kill: raise KILL_AFTER or ROWS"; else echo "crashed as intended (exit $?)"; fi
 wait
 bash "$OUT/parallel.sh" > "$OUT/resume_stdout.txt"
-$PSQL -f challenge/digest.sql > "$OUT/digest_resume.txt"; $PSQL -c "SELECT table_name, row_count FROM public.pgdm_table_row_counts ORDER BY 1" > "$OUT/counts_resume.txt"
-diff "$OUT/digest_baseline.txt" "$OUT/digest_resume.txt" && diff "$OUT/counts_baseline.txt" "$OUT/counts_resume.txt" && echo "RESUME_IDENTICAL"
+state > "$OUT/state_resume.txt"; $PSQL -f challenge/digest.sql > "$OUT/digest_resume.txt"; $PSQL -c "SELECT table_name, row_count FROM public.pgdm_table_row_counts ORDER BY 1" > "$OUT/counts_resume.txt"
+diff "$OUT/digest_baseline.txt" "$OUT/digest_resume.txt" && diff "$OUT/counts_baseline.txt" "$OUT/counts_resume.txt" && diff "$OUT/state_baseline.txt" "$OUT/state_resume.txt" && echo "RESUME_IDENTICAL"
 
 echo "== 7. malformed input (one source row gets a non-integer value; restored afterwards)"
 BAD=$((HI * 5 / 6))
-state() { $PSQL -c "SELECT string_agg(table_name || '=' || row_count, ' ' ORDER BY table_name) FROM public.pgdm_table_row_counts"
-  $PSQL -c "SELECT string_agg(conrelid::regclass || ' ' || conname, ', ' ORDER BY conrelid::regclass::text, conname) FROM pg_constraint WHERE conrelid::regclass::text ~ 'table[1-6]$'"; }
 reset; state > "$OUT/state_before.txt"
 OLD=$($PSQL -c "SELECT raw::text FROM public.raw_data WHERE raw_id = $BAD")
 $PSQL -c "UPDATE public.raw_data SET raw = jsonb_set(raw, '{values,integer_column_2}', '\"abc\"') WHERE raw_id = $BAD"
@@ -77,4 +78,15 @@ state > "$OUT/state_parallel.txt"
 echo "UPDATE public.raw_data SET raw = :'v'::jsonb WHERE raw_id = $BAD;" | $PSQL -v v="$OLD"
 grep -h -o 'invalid input syntax[^"]*"abc"' "$OUT/bad_serial.txt" "$OUT/bad_parallel.txt" | uniq -c
 diff "$OUT/state_before.txt" "$OUT/state_serial.txt" && diff "$OUT/state_before.txt" "$OUT/state_parallel.txt" && echo "MALFORMED_INPUT_ROLLED_BACK_BOTH"
+
+echo "== 8. failing deferred constraint (temporary UNIQUE on table5.numeric_column_1, dropped afterwards)"
+add_dup() { $PSQL -c "ALTER TABLE public.table5 ADD CONSTRAINT table5_check_dup_key UNIQUE (numeric_column_1)"; }
+reset; add_dup; state > "$OUT/state_before8.txt"
+if $PSQL -f "$OUT/baseline.sql" 2> "$OUT/dup_serial.txt"; then echo "serial did not fail"; fi
+state > "$OUT/state_serial8.txt"
+if bash "$OUT/parallel.sh" > /dev/null 2> "$OUT/dup_parallel.txt"; then echo "parallel did not fail"; fi
+state > "$OUT/state_parallel8.txt"
+$PSQL -c "ALTER TABLE public.table5 DROP CONSTRAINT table5_check_dup_key"
+grep -h -o 'ERROR: .*table5_check_dup_key"' "$OUT/dup_serial.txt" "$OUT/dup_parallel.txt" | sort | uniq -c
+diff "$OUT/state_before8.txt" "$OUT/state_serial8.txt" && diff "$OUT/state_before8.txt" "$OUT/state_parallel8.txt" && echo "CONSTRAINT_FAILURE_ROLLED_BACK_BOTH"
 cat "$OUT/times.txt"

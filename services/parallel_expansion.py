@@ -36,7 +36,7 @@ DATA_TABLE_ROW_COUNTS = '"public"."pgdm_table_row_counts"'  # same as postgres_s
 PSQL = "psql -X -qAt -v ON_ERROR_STOP=1"
 # synchronous_commit=off only: chunks are checkpointed by the progress table, and a lost async commit is just a chunk that
 # reruns. Bigger work_mem gave no speed at 300k rows (16.7 vs 18.7 s) and costs RAM per worker, so it stays at the default.
-SESSION_GUCS = "-c synchronous_commit=off"
+SESSION_GUCS = "-c synchronous_commit=off -c client_min_messages=warning"
 REBUILD_MAINTENANCE_WORK_MEM = "256MB"  # index builds for the re-added UNIQUE constraints sort the whole table
 
 
@@ -221,7 +221,7 @@ def build_parallel_expansion_script(*, database_name, sql_username, source_quali
                    f"trap 'grep -m1 -E \"{FATAL_SQLSTATE_RE}\" \"$W/stderr\" | sed \"s/^psql:[^ ]* //\" > \"$W/fatal\" || true; cat \"$W/stderr\" >&3' EXIT",
                    'phase() { local t=$(ts) n=$1; shift; "$@"; '
                    'echo "{\\"pgdm_phase\\": \\"$n\\", \\"seconds\\": $(( ($(ts) - t) / 1000000 ))e-3}"; }']
-    out.append(_heredoc("$W/defer.sql", _defer_sql(key, destinations, source_qualified)))
+    out.append(_heredoc("$W/defer.sql", "\\set VERBOSITY verbose\n" + _defer_sql(key, destinations, source_qualified)))
     phase_lines.append(f'phase "Defer destination constraints" {psql} -f "$W/defer.sql"')
     for w, jobs in enumerate(waves):
         files = []
@@ -242,7 +242,7 @@ def build_parallel_expansion_script(*, database_name, sql_username, source_quali
                            f"{psql} -f {{}}'")
     tables = sorted({d["qualified_name"] for d in destinations})
     for i, t in enumerate(tables):
-        out.append(_heredoc(f"$W/rebuild_{i}.sql", _rebuild_sql(key, t)))
+        out.append(_heredoc(f"$W/rebuild_{i}.sql", "\\set VERBOSITY verbose\n" + _rebuild_sql(key, t)))
     phase_lines.append(f"phase \"Rebuild deferred constraints\" sh -c 'ls \"$W\"/rebuild_*.sql | xargs -P {workers} "
                        f"-I{{}} {psql} -f {{}}'")
     out.append(_heredoc("$W/phases.sh", "\n".join(phase_lines)))

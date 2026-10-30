@@ -38,7 +38,8 @@ The executor falls back to the original batch when the source has no integer `ra
 generates the official database with `generate_database.py`, then runs the serial baseline and the parallel executor.
 It compares id-insensitive digests of all six tables (`challenge/digest.sql`) and the row counters, and finally kills
 the workers mid-run and checks that a resumed run gives identical results. Last, it corrupts one source value and
-checks that both paths fail with the same error and leave the tables, counters and constraints unchanged. `SKIP_GEN=1` reuses an existing database.
+checks that both paths fail and leave the tables, counters and constraints unchanged; step 8 does the same for a
+violated deferred constraint. `SKIP_GEN=1` reuses an existing database.
 
 ## Measured with the GUI (MEASURED PROCESSING TOTAL)
 Run Expand once with `PGDM_EXPAND_WORKERS=1` (original path) and once with the default. In the parallel path the server
@@ -50,8 +51,8 @@ diagnostics outside the total, because summing parallel work would report CPU ti
   the executor undoes the run instead: it deletes every row the run committed (each chunk records its transaction id,
   rows are matched by `xmin`), restores the row counters and the deferred constraints, clears the checkpoint and reports
   the original error. The database ends as before the Expand, as with the original's rollback. This is tested end to end
-  with a malformed source value (step 7 of `run_check.sh`). The same path handles a failed constraint rebuild
-  (duplicate keys), but that case is not yet tested end to end.
+  with a malformed source value (step 7 of `run_check.sh`) and with a deferred UNIQUE constraint that the data violates
+  (step 8). It also works when the tables already held rows from an earlier Expand: only this run's rows are removed.
 - While a run is undone, its rows were briefly visible to other sessions. The original never shows partial rows.
 - Surrogate ids are assigned per chunk, so ids interleave differently from the serial run. All natural keys and joins
   are identical.
