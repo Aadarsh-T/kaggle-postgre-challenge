@@ -41,14 +41,14 @@ reset
     echo "UPDATE public.pgdm_table_row_counts SET row_count = (SELECT count(*) FROM public.$t) WHERE table_name = '$t';"
   done; echo "COMMIT;"; } > "$OUT/baseline.sql"
 t0=$(now); $PSQL -f "$OUT/baseline.sql"; t1=$(now)
-echo "baseline_seconds $(echo "$t1 - $t0" | bc)" | tee "$OUT/times.txt"
+echo "baseline_seconds $(awk "BEGIN{print $t1 - $t0}")" | tee "$OUT/times.txt"
 $PSQL -f challenge/digest.sql > "$OUT/digest_baseline.txt"; $PSQL -c "SELECT table_name, row_count FROM public.pgdm_table_row_counts ORDER BY 1" > "$OUT/counts_baseline.txt"
 
 echo "== 4. parallel expansion"
 reset
 DB=$PGDATABASE HI=$HI WORKERS=${WORKERS:-$(nproc)} CHUNKS=${CHUNKS:-$((4 * $(nproc)))} OUT="$OUT/parallel.sh" python3 challenge/bench_harness.py "SQL files" >/dev/null
 t0=$(now); bash "$OUT/parallel.sh" > "$OUT/parallel_stdout.txt"; t1=$(now)
-echo "parallel_seconds $(echo "$t1 - $t0" | bc)" | tee -a "$OUT/times.txt"
+echo "parallel_seconds $(awk "BEGIN{print $t1 - $t0}")" | tee -a "$OUT/times.txt"
 $PSQL -f challenge/digest.sql > "$OUT/digest_parallel.txt"; $PSQL -c "SELECT table_name, row_count FROM public.pgdm_table_row_counts ORDER BY 1" > "$OUT/counts_parallel.txt"
 
 echo "== 5. equivalence"
