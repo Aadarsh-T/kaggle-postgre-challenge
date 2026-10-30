@@ -20,7 +20,9 @@ another. Each statement is one serial INSERT ... SELECT over the whole source. T
 5. Before the load, drops the FK and UNIQUE constraints that no recipe in the batch depends on. Their definitions are
    read from the catalog and saved in the checkpoint table. After the load it rebuilds them and verifies every chunk and
    every constraint. The FK to the source is kept.
-6. If anything fails (worker killed, server restart, SSH loss) only whole chunks remain. Rerunning the same Expand skips
+6. A deterministic SQL error (bad input value, constraint violation) undoes the whole run and reports the error, so the
+   result matches the original's rollback (see Limits).
+7. If anything fails (worker killed, server restart, SSH loss) only whole chunks remain. Rerunning the same Expand skips
    them, finishes the rest, rebuilds, verifies and then registers the versions. The original has no resume path.
 
 ## Settings (environment variables on the manager)
@@ -35,7 +37,8 @@ The executor falls back to the original batch when the source has no integer `ra
 `challenge/run_check.sh [ROWS]` (Linux or WSL, PostgreSQL 16, libpq env vars for the connection) runs the unit tests,
 generates the official database with `generate_database.py`, then runs the serial baseline and the parallel executor.
 It compares id-insensitive digests of all six tables (`challenge/digest.sql`) and the row counters, and finally kills
-the workers mid-run and checks that a resumed run gives identical results. `SKIP_GEN=1` reuses an existing database.
+the workers mid-run and checks that a resumed run gives identical results. Last, it corrupts one source value and
+checks that both paths fail with the same error and leave the tables, counters and constraints unchanged. `SKIP_GEN=1` reuses an existing database.
 
 ## Measured with the GUI (MEASURED PROCESSING TOTAL)
 Run Expand once with `PGDM_EXPAND_WORKERS=1` (original path) and once with the default. In the parallel path the server
@@ -43,8 +46,13 @@ part is counted once, as the remote wall-clock time of the script. The per-chunk
 diagnostics outside the total, because summing parallel work would report CPU time rather than elapsed time.
 
 ## Limits
-- If rebuilding a deferred constraint fails (for example duplicate keys in the input), the loaded rows stay and Expand
-  stops with an error. The original would roll back everything.
+- Deterministic SQL errors (SQLSTATE classes 22 data, 23 integrity, 42 syntax/access, P0 raise) are not resumable, so
+  the executor undoes the run instead: it deletes every row the run committed (each chunk records its transaction id,
+  rows are matched by `xmin`), restores the row counters and the deferred constraints, clears the checkpoint and reports
+  the original error. The database ends as before the Expand, as with the original's rollback. This is tested end to end
+  with a malformed source value (step 7 of `run_check.sh`). The same path handles a failed constraint rebuild
+  (duplicate keys), but that case is not yet tested end to end.
+- While a run is undone, its rows were briefly visible to other sessions. The original never shows partial rows.
 - Surrogate ids are assigned per chunk, so ids interleave differently from the serial run. All natural keys and joins
   are identical.
 - Faster only when the server has more than one core. With one core, use `PGDM_EXPAND_WORKERS=1`.

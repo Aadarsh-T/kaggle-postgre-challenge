@@ -32,6 +32,7 @@ import json
 import re
 
 PROGRESS_TABLE = "public.pgdm_expand_progress"
+DATA_TABLE_ROW_COUNTS = '"public"."pgdm_table_row_counts"'  # same as postgres_service.DATA_TABLE_ROW_COUNTS
 PSQL = "psql -X -qAt -v ON_ERROR_STOP=1"
 # synchronous_commit=off only: chunks are checkpointed by the progress table, and a lost async commit is just a chunk that
 # reruns. Bigger work_mem gave no speed at 300k rows (16.7 vs 18.7 s) and costs RAM per worker, so it stays at the default.
@@ -115,7 +116,7 @@ def _chunk_sql(key, dest, idx, lo, hi, statement, dml_builder, ranged_source, so
     dml = dml_builder(statement, dest, idx)
     unit = f"{dest['table_name']}#{idx}"
     return (
-        f"{TIMING_TABLE_DDL}\nTRUNCATE pg_temp.pgdm_expansion_timings;\n"
+        f"\\set VERBOSITY verbose\n{TIMING_TABLE_DDL}\nTRUNCATE pg_temp.pgdm_expansion_timings;\n"
         "BEGIN;\n"
         # serialises the same chunk across runs (e.g. an orphaned worker of a dropped SSH session vs the resumed run):
         # the second waiter then sees the first one's committed progress row and skips
@@ -124,8 +125,8 @@ def _chunk_sql(key, dest, idx, lo, hi, statement, dml_builder, ranged_source, so
         f"AND unit = {_lit(unit)} AND lo = {lo}) AS pgdm_todo \\gset\n"
         "\\if :pgdm_todo\n"
         f"{dml}\n"
-        f"INSERT INTO {PROGRESS_TABLE} (run_key, kind, unit, lo, hi, rows, seconds) SELECT {_lit(key)}, 'chunk', "
-        f"{_lit(unit)}, {lo}, {hi}, rows_affected, EXTRACT(EPOCH FROM finished_at - started_at) "
+        f"INSERT INTO {PROGRESS_TABLE} (run_key, kind, unit, lo, hi, rows, seconds, payload) SELECT {_lit(key)}, 'chunk', "
+        f"{_lit(unit)}, {lo}, {hi}, rows_affected, EXTRACT(EPOCH FROM finished_at - started_at), txid_current()::text "
         "FROM pg_temp.pgdm_expansion_timings;\n"
         "\\endif\n"
         "COMMIT;\n"
@@ -175,6 +176,30 @@ END $r$;
 """.strip()
 
 
+# SQLSTATE classes that fail the same way on every retry (data exception, integrity, syntax/access, PL/pgSQL raise):
+# such a run is undone instead of offered for resume. Anything else (killed backend, restart, deadlock) stays resumable.
+FATAL_SQLSTATE_RE = "ERROR:  (22|23|42|P0)[0-9A-Z]{3}:"
+
+
+def _undo_sql(key, waves, tables, by_name):
+    """Remove every row this run committed (rows carry their chunk's xid as xmin), restore the row counters and the
+    deferred constraints, and forget the checkpoint: the database ends as it was before the Expand."""
+    parts = []
+    for w in reversed(waves):  # children first (FKs)
+        for job in w:
+            t, d = job["table_name"], by_name[job["table_name"]]
+            parts.append(f"""
+DELETE FROM {t} WHERE xmin::text::bigint IN (SELECT payload::bigint % 4294967296 FROM {PROGRESS_TABLE}
+  WHERE run_key = {_lit(key)} AND kind = 'chunk' AND unit LIKE {_lit(t + '#%')});
+UPDATE {DATA_TABLE_ROW_COUNTS} c SET row_count = c.row_count - s.n, updated_at = clock_timestamp()
+FROM (SELECT coalesce(sum(rows), 0) AS n FROM {PROGRESS_TABLE} WHERE run_key = {_lit(key)} AND kind = 'chunk'
+      AND unit LIKE {_lit(t + '#%')}) s
+WHERE c.schema_name = {_lit(d['schema_name'])} AND c.table_name = {_lit(d['pure_table_name'])};""")
+    parts += [_rebuild_sql(key, t) for t in tables]
+    parts.append(f"DELETE FROM {PROGRESS_TABLE} WHERE run_key = {_lit(key)};")
+    return "\n".join(p.strip() for p in parts)
+
+
 def build_parallel_expansion_script(*, database_name, sql_username, source_qualified, source_relation_sql, manifest_sql,
                                     destinations, waves, dml_builder, lo, hi, workers=4, chunks=16, key=None, psql_cmd=None,
                                     timing_table_sql=None, timing_result_sql=None):
@@ -192,6 +217,8 @@ def build_parallel_expansion_script(*, database_name, sql_username, source_quali
            'W=$(mktemp -d); trap \'rm -rf "$W"\' EXIT', "export W", ""]
     expected = []
     phase_lines = ["set -euo pipefail", "ts() { date +%s%N; }",
+                   'exec 3>&2 2>>"$W/stderr"',
+                   f"trap 'grep -m1 -E \"{FATAL_SQLSTATE_RE}\" \"$W/stderr\" | sed \"s/^psql:[^ ]* //\" > \"$W/fatal\" || true; cat \"$W/stderr\" >&3' EXIT",
                    'phase() { local t=$(ts) n=$1; shift; "$@"; '
                    'echo "{\\"pgdm_phase\\": \\"$n\\", \\"seconds\\": $(( ($(ts) - t) / 1000000 ))e-3}"; }']
     out.append(_heredoc("$W/defer.sql", _defer_sql(key, destinations, source_qualified)))
@@ -230,6 +257,7 @@ def build_parallel_expansion_script(*, database_name, sql_username, source_quali
         return (f"UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = {seq};\n"
                 if timing_table_sql else "")
 
+    undo = _undo_sql(key, waves, tables, by_name)
     coord = f"""
 CREATE TABLE IF NOT EXISTS {PROGRESS_TABLE} (run_key text, kind text, unit text, lo bigint, hi bigint,
     rows bigint, seconds double precision, payload text, done_at timestamptz DEFAULT clock_timestamp(), PRIMARY KEY (run_key, kind, unit, lo));
@@ -238,6 +266,13 @@ BEGIN;
 {_t(2, "Acquire destination table locks")}LOCK TABLE {source_qualified} IN SHARE MODE;
 {locks}{_t_end(2)}{_t(3, "Scan source and build dependency manifest")}{manifest_sql}
 {_t_end(3)}\\! bash "$W/phases.sh"
+\\set pgdm_fatal `cat "$W/fatal" 2>/dev/null || true`
+SELECT :'pgdm_fatal' <> '' AS pgdm_is_fatal, set_config('pgdm.fatal', :'pgdm_fatal', false) AS pgdm_fatal_set \\gset
+\\if :pgdm_is_fatal
+{undo}
+COMMIT;
+DO $f$ BEGIN RAISE EXCEPTION 'expansion failed, all rows of this run were removed and nothing was registered: %', current_setting('pgdm.fatal'); END $f$;
+\\endif
 DO $v$ DECLARE missing bigint; BEGIN
   SELECT count(*) INTO missing FROM (VALUES {exp_values}) e(unit, lo) WHERE NOT EXISTS (SELECT 1 FROM {PROGRESS_TABLE} p
     WHERE p.run_key = {_lit(key)} AND p.kind = 'chunk' AND p.unit = e.unit AND p.lo = e.lo);

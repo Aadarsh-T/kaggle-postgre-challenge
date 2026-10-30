@@ -47,6 +47,18 @@ class ParallelExpansionTest(unittest.TestCase):
                   "rerun the same Expand to resume", f"DELETE FROM {pe.PROGRESS_TABLE} WHERE run_key = '{key}'"):
             self.assertIn(s, script)
         self.assertEqual(key, pe.run_key("db", SRC, ds))
+        # deterministic SQL errors undo the run (rows by chunk xid, counters, constraints) instead of offering a resume
+        for s in ("\\set VERBOSITY verbose", "txid_current()::text", "xmin::text::bigint IN",
+                  "all rows of this run were removed", pe.FATAL_SQLSTATE_RE):
+            self.assertIn(s, script)
+
+    def test_fatal_sqlstate_classes(self):
+        import re
+        fatal = re.compile(pe.FATAL_SQLSTATE_RE)
+        self.assertTrue(fatal.search('psql:w.sql:3: ERROR:  22P02: invalid input syntax for type smallint: "abc"'))
+        self.assertTrue(fatal.search("ERROR:  23505: duplicate key value violates unique constraint"))
+        self.assertFalse(fatal.search("FATAL:  57P01: terminating connection due to administrator command"))
+        self.assertFalse(fatal.search("ERROR:  40P01: deadlock detected"))
 
 
 if __name__ == "__main__":
