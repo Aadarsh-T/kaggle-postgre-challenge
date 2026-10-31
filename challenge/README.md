@@ -41,6 +41,19 @@ the workers mid-run and checks that a resumed run gives identical results. Last,
 checks that both paths fail and leave the tables, counters and constraints unchanged; step 8 does the same for a
 violated deferred constraint. `SKIP_GEN=1` reuses an existing database.
 
+## Results on the official data (run_check.sh, no GUI)
+Official generator, 1,000,000 rows (fixed seed 4918304907611952177), PostgreSQL 16.15 in WSL Ubuntu 24.04, 8 cores,
+commit `186f8cb` (run_check fixes since then do not touch the executor):
+
+| path | seconds |
+|---|---|
+| original serial batch (one REPEATABLE READ transaction, recipes 01..06) | 54.41 |
+| parallel executor (8 workers, 32 chunks) | 31.04 (1.75x) |
+
+Digests of all six tables, row counters and constraint lists identical; crash + resume identical; malformed input and a
+violated deferred constraint leave the database unchanged on both paths. The server-side run is measured from psql
+start to COMMIT; the GUI's MEASURED PROCESSING TOTAL adds the SSH round trip and the app overhead to both paths.
+
 ## Measured with the GUI (MEASURED PROCESSING TOTAL)
 Run Expand once with `PGDM_EXPAND_WORKERS=1` (original path) and once with the default. In the parallel path the server
 part is counted once, as the remote wall-clock time of the script. The per-chunk PostgreSQL timings are still shown, but as
@@ -54,6 +67,10 @@ diagnostics outside the total, because summing parallel work would report CPU ti
   with a malformed source value (step 7 of `run_check.sh`) and with a deferred UNIQUE constraint that the data violates
   (step 8). It also works when the tables already held rows from an earlier Expand: only this run's rows are removed.
 - While a run is undone, its rows were briefly visible to other sessions. The original never shows partial rows.
+- Error text for a violated UNIQUE constraint: both paths fail with SQLSTATE 23505 and leave the database unchanged, but
+  the message differs. The original fails while inserting ("duplicate key value violates unique constraint ..."); the
+  parallel path drops the constraint for the load and fails when re-adding it ("could not create unique index ...").
+  Error-class handling is identical; tools that match on SQLSTATE see no difference, tools that match on the text do.
 - Surrogate ids are assigned per chunk, so ids interleave differently from the serial run. All natural keys and joins
   are identical.
 - Faster only when the server has more than one core. With one core, use `PGDM_EXPAND_WORKERS=1`.

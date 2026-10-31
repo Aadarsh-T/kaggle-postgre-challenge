@@ -16,9 +16,11 @@ now() { date +%s.%N; }
 
 if [ -z "${SKIP_GEN:-}" ]; then  # SKIP_GEN=1: reuse an existing kaggle_challenge database
 echo "== 1. unit tests"; python3 -m unittest discover -s tests -v > "$OUT/tests.txt" 2>&1 && echo TESTS_OK || echo "TESTS_FAILED (see $OUT/tests.txt)"; tail -4 "$OUT/tests.txt"
+python3 -c "import tkinter" 2>/dev/null || echo "note: python3-tk missing -> the upstream GUI test test_expansion_timing errors on import (environment only; sudo apt install python3-tk)"
 
 echo "== 2. generate $ROWS rows"
-python3 generate_database.py --rows "$ROWS" --replace --user "${PGUSER:-$USER}" ${PGHOST:+--host "$PGHOST"} ${PGPORT:+--postgres_port "$PGPORT"}
+# the generator opens an admin connection first: keep the exported PGDATABASE away from it (QD8 issue 1)
+env -u PGDATABASE python3 generate_database.py --rows "$ROWS" --replace --admin_database "${ADMIN_DB:-postgres}" --user "${PGUSER:-$USER}" ${PGHOST:+--host "$PGHOST"} ${PGPORT:+--postgres_port "$PGPORT"}
 fi
 HI=$($PSQL -c "SELECT max(raw_id) FROM public.raw_data")
 $PSQL -c "CREATE TABLE IF NOT EXISTS public.pgdm_table_row_counts (schema_name text NOT NULL, table_name text NOT NULL,
@@ -52,6 +54,7 @@ reset
 DB=$PGDATABASE HI=$HI WORKERS=${WORKERS:-$(nproc)} CHUNKS=${CHUNKS:-$((4 * $(nproc)))} OUT="$OUT/parallel.sh" python3 challenge/bench_harness.py "SQL files" >/dev/null
 t0=$(now); bash "$OUT/parallel.sh" > "$OUT/parallel_stdout.txt"; t1=$(now)
 echo "parallel_seconds $(awk "BEGIN{print $t1 - $t0}")" | tee -a "$OUT/times.txt"
+grep -h '"pgdm_phase"' "$OUT/parallel_stdout.txt" | tee -a "$OUT/times.txt" || true
 state > "$OUT/state_parallel_run.txt"; $PSQL -f challenge/digest.sql > "$OUT/digest_parallel.txt"; $PSQL -c "SELECT table_name, row_count FROM public.pgdm_table_row_counts ORDER BY 1" > "$OUT/counts_parallel.txt"
 
 echo "== 5. equivalence"
@@ -82,11 +85,14 @@ diff "$OUT/state_before.txt" "$OUT/state_serial.txt" && diff "$OUT/state_before.
 echo "== 8. failing deferred constraint (temporary UNIQUE on table5.numeric_column_1, dropped afterwards)"
 add_dup() { $PSQL -c "ALTER TABLE public.table5 ADD CONSTRAINT table5_check_dup_key UNIQUE (numeric_column_1)"; }
 reset; add_dup; state > "$OUT/state_before8.txt"
-if $PSQL -f "$OUT/baseline.sql" 2> "$OUT/dup_serial.txt"; then echo "serial did not fail"; fi
+if $PSQL -v VERBOSITY=verbose -f "$OUT/baseline.sql" 2> "$OUT/dup_serial.txt"; then echo "serial did not fail"; fi
 state > "$OUT/state_serial8.txt"
 if bash "$OUT/parallel.sh" > /dev/null 2> "$OUT/dup_parallel.txt"; then echo "parallel did not fail"; fi
 state > "$OUT/state_parallel8.txt"
 $PSQL -c "ALTER TABLE public.table5 DROP CONSTRAINT table5_check_dup_key"
 grep -h -o 'ERROR: .*table5_check_dup_key"' "$OUT/dup_serial.txt" "$OUT/dup_parallel.txt" | sort | uniq -c
+# same SQLSTATE 23505 on both paths; the text differs because the serial path fails at the deferred check on INSERT/COMMIT while the
+# parallel path inserts first and fails when it re-adds the UNIQUE constraint (CREATE UNIQUE INDEX). Documented in challenge/README.md.
+[ "$(grep -l 'ERROR:  23505' "$OUT/dup_serial.txt" "$OUT/dup_parallel.txt" | wc -l)" = 2 ] && echo "SQLSTATE_23505_BOTH"
 diff "$OUT/state_before8.txt" "$OUT/state_serial8.txt" && diff "$OUT/state_before8.txt" "$OUT/state_parallel8.txt" && echo "CONSTRAINT_FAILURE_ROLLED_BACK_BOTH"
 cat "$OUT/times.txt"
